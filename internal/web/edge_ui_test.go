@@ -63,18 +63,16 @@ func TestUIViaEdge(t *testing.T) {
 			t.Errorf("lanOnly(%s) = %v", ip, got)
 		}
 	}
-	// Docker-Bridge-Netz ohne veroeffentlichte Ports (Gateway ohne Dienst): Seite Ports warnt mit Beispiel
+	// Without a working gateway or Docker API, the ports page shows an inconclusive check.
+	t.Setenv("NODE64_DOCKER_HOST", "unavailable")
 	defer edge.BridgeForTest(true, netip.MustParseAddr("127.0.0.2"))()
-	if d := a.s.portsPageData(ctx, "", ""); !d.Pub.Bridge || !d.Pub.MissingPort(cfg.HTTPSPort) {
+	if d := a.s.portsPageData(ctx, "", ""); !d.Pub.Bridge || d.Pub.Publication(cfg.HTTPSPort) != "unknown" {
 		t.Fatalf("published: %+v", d.Pub)
 	}
 	loginAs(t, a, "admin", "sehr geheimes passwort")
 	_, body := a.get(t, "/settings/ports")
-	hp := strconv.Itoa(cfg.HTTPSPort)
-	for _, want := range []string{`id="published"`, "-p " + hp + ":" + hp, `- &#34;` + hp + ":" + hp + `&#34;`, "network_mode: host"} {
-		if !strings.Contains(body, want) {
-			t.Errorf("ports page lacks %q", want)
-		}
+	if strings.Contains(body, `id="published"`) || !strings.Contains(body, `could not be verified`) && !strings.Contains(body, `nicht prüfbar`) {
+		t.Error("ports page should show an inconclusive check without a missing mapping alert")
 	}
 	_ = a.store.SetSetting(ctx, setUIName, "")
 	if err := a.s.uiRoute(ctx); err != nil || len(e.Status().Names) != 0 {

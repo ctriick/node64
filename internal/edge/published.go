@@ -8,21 +8,21 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ipv64net/node64/internal/dns64/localnet"
+	"github.com/ipv64net/node64/internal/dockerports"
+	"github.com/ipv64net/node64/internal/proxmox"
 )
 
-// Docker-Bridge-Netz: Lauschen im Container reicht fuer PROXY64 nicht, HTTP- und HTTPS-Port muessen auf dem
-// Docker-Host veroeffentlicht sein (-p 80:80 -p 443:443 bzw. ports: in compose). Die Pruefung schickt eine Anfrage mit
-// Pruefwert ueber das Gateway (den Docker-Host) an denselben Port; kommt sie beim eigenen Listener an, ist der Port
-// veroeffentlicht (Hairpin, siehe localnet.Gateway). Ein anderes Programm auf dem Host antwortet nicht mit dem
-// Pruefwert und zaehlt deshalb nicht.
-
+// Docker bindings and gateway probes provide evidence of publication. A failed
+// gateway probe alone is inconclusive because hairpin NAT may be unavailable.
 const (
 	probePath   = "/.well-known/node64-probe/" // Port 80: Pfad mit Pruefwert
 	probeSuffix = ".probe.node64.invalid"      // Port 443: Pruefwert als SNI-Name
@@ -38,11 +38,14 @@ var (
 
 // Published ist das Ergebnis der Pruefung.
 type Published struct {
-	Bridge  bool             `json:"bridge"`            // Container im Bridge-Netz (sonst ist nichts zu pruefen)
-	Gateway string           `json:"gateway,omitempty"` // Docker-Host
-	Missing []ListenerStatus `json:"missing,omitempty"` // laufende Dienste (http, https), deren Port auf dem Host fehlt
-	H3Port  int              `json:"h3_port,omitempty"` // HTTP/3 laeuft (UDP, nicht pruefbar, aber fuer das Beispiel)
-	At      time.Time        `json:"at"`
+	Bridge   bool             `json:"bridge"`            // Container im Bridge-Netz (sonst ist nichts zu pruefen)
+	Gateway  string           `json:"gateway,omitempty"` // Docker-Host
+	Verified []ListenerStatus `json:"verified,omitempty"`
+	Observed []ListenerStatus `json:"observed,omitempty"`
+	Unknown  []ListenerStatus `json:"unknown,omitempty"`
+	Missing  []ListenerStatus `json:"missing,omitempty"` // laufende Dienste (http, https), deren Port auf dem Host fehlt
+	H3Port   int              `json:"h3_port,omitempty"` // HTTP/3 laeuft (UDP, nur fuer das Beispiel)
+	At       time.Time        `json:"at"`
 }
 
 // MissingPort: der TCP-Port des Eingangs ist auf dem Host nicht veroeffentlicht.
@@ -53,6 +56,30 @@ func (p Published) MissingPort(port int) bool {
 		}
 	}
 	return false
+}
+
+// Publication returns the status of a checked TCP port, or an empty string if
+// the port was outside the scope of the check.
+func (p Published) Publication(port int) string {
+	if p.MissingPort(port) {
+		return "no"
+	}
+	for _, l := range p.Observed {
+		if l.Port == port {
+			return "observed"
+		}
+	}
+	for _, l := range p.Verified {
+		if l.Port == port {
+			return "yes"
+		}
+	}
+	for _, l := range p.Unknown {
+		if l.Port == port {
+			return "unknown"
+		}
+	}
+	return ""
 }
 
 // PortList: die fehlenden Ports fuer den Text ("80 und 443" als "80, 443").
@@ -122,38 +149,92 @@ func (e *Edge) Published(ctx context.Context) Published {
 			continue
 		}
 		run = append(run, l)
-		key += " " + l.Name + ":" + strconv.Itoa(l.Port)
+		key += " " + l.Name + ":" + strconv.Itoa(l.Port) + ":" + strconv.FormatBool(l.external)
 	}
 	pub := st.Config.publicPort()
-	key += " " + strconv.Itoa(pub)
+	key += " " + strconv.Itoa(pub) + " " + strconv.Itoa(h3)
 	if c := e.pub.Load(); c != nil && c.key == key && time.Since(c.res.At) < probeTTL {
 		return c.res
 	}
 	res := Published{Bridge: true, H3Port: h3, At: time.Now()}
 	if gw.IsValid() {
 		res.Gateway = gw.String()
-		var mu sync.Mutex
+	}
+	var pending []ListenerStatus
+	for _, l := range run {
+		if l.external {
+			res.Observed = append(res.Observed, l)
+		} else {
+			pending = append(pending, l)
+		}
+	}
+	if len(pending) > 0 {
+		var binds dockerports.Bindings
+		if self, err := os.Hostname(); err == nil {
+			binds = dockerports.Read(ctx, proxmox.DefaultDockerHost(), self)
+		}
+		verified := make([]bool, len(pending))
 		var wg sync.WaitGroup
-		for _, l := range run {
+		for i, l := range pending {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				ok := e.probe(ctx, gw, l.Name, l.Port)
-				if !ok && l.Name == "https" && pub != l.Port { // anders veroeffentlicht (-p 8443:443, Einstellung Port nach aussen)
-					ok = e.probe(ctx, gw, l.Name, pub)
-				}
-				if !ok {
-					mu.Lock()
-					res.Missing = append(res.Missing, l)
-					mu.Unlock()
+				key := strconv.Itoa(l.Port) + "/tcp"
+				alternate := l.Name == "https" && pub != l.Port
+				verified[i] = binds.Has(key, l.Port) || (alternate && binds.Has(key, pub))
+				if !verified[i] && gw.IsValid() {
+					verified[i] = e.probe(ctx, gw, l.Name, l.Port) || (alternate && e.probe(ctx, gw, l.Name, pub))
 				}
 			}()
 		}
 		wg.Wait()
+		for i, l := range pending {
+			switch {
+			case verified[i]:
+				res.Verified = append(res.Verified, l)
+			case binds != nil:
+				res.Missing = append(res.Missing, l)
+			default:
+				res.Unknown = append(res.Unknown, l)
+			}
+		}
 		sort.Slice(res.Missing, func(i, j int) bool { return res.Missing[i].Port < res.Missing[j].Port })
+	}
+	if ctx.Err() != nil {
+		return res
 	}
 	e.pub.Store(&pubCache{key: key, res: res})
 	return res
+}
+
+// publicationListener observes physical TCP peers before PROXY protocol rewriting.
+type publicationListener struct {
+	net.Listener
+	external *atomic.Bool
+}
+
+func (l publicationListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err == nil && !l.external.Load() {
+		l.observe(addrIP(conn.RemoteAddr()))
+	}
+	return conn, err
+}
+
+func (l publicationListener) observe(ip netip.Addr) {
+	if !ip.IsGlobalUnicast() {
+		return
+	}
+	nets := localnet.LocalNets()
+	if len(nets) == 0 {
+		return
+	}
+	for _, subnet := range nets {
+		if subnet.Contains(ip) {
+			return
+		}
+	}
+	l.external.Store(true)
 }
 
 // probe schickt eine Pruefanfrage an gw:port und meldet, ob sie beim eigenen Listener ankam.

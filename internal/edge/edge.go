@@ -218,6 +218,7 @@ type Edge struct {
 
 // listener ist einer der drei Dienste (http, https, http3).
 type listener struct {
+	external *atomic.Bool
 	claim ports.Claim
 	addr  string
 	err   string
@@ -546,6 +547,7 @@ type Status struct {
 }
 
 type ListenerStatus struct {
+	external bool
 	Name    string      `json:"name"` // http, https, http3
 	Proto   ports.Proto `json:"proto"`
 	Port    int         `json:"port"`
@@ -577,7 +579,7 @@ func (e *Edge) Status() Status {
 		if c.Port == 0 {
 			continue
 		}
-		st.Listeners = append(st.Listeners, ListenerStatus{Name: name, Proto: c.Proto, Port: c.Port, Needed: need[name], Running: l.stop != nil, Addr: l.addr, Error: l.err})
+		st.Listeners = append(st.Listeners, ListenerStatus{Name: name, Proto: c.Proto, Port: c.Port, Needed: need[name], Running: l.stop != nil, Addr: l.addr, Error: l.err, external: l.external != nil && l.external.Load()})
 	}
 	for o, list := range e.owners {
 		for _, rt := range list {
@@ -701,6 +703,8 @@ func (e *Edge) startLocked(name string) error {
 		if err != nil {
 			return err
 		}
+		l.external = new(atomic.Bool)
+		ln = publicationListener{Listener: ln, external: l.external}
 		ln = e.proxyListen(ln, e.cfg) // vorgeschalteter Proxy mit PROXY-Kopf: echte Besucher-Adresse
 		srv := &http.Server{ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 120 * time.Second, MaxHeaderBytes: 64 << 10, ErrorLog: errLog}
 		if name == "http" {
