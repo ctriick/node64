@@ -136,6 +136,17 @@ PROXY64 und DNS64 lesen auf Wunsch Docker-Labels (`node64.proxy.*`, `node64.dns.
 
 **Proxmox VE und Docker überwachen:** Seit Healthchecks 3.0.0 gehört das zum Modul **Monitor64**. Die früheren Proxmox-/Docker-Checks der Healthchecks (Check-Typen `docker` und `proxmox`, Seiten *Healthchecks → Proxmox VE/Docker*) wurden beim Update samt Daten entfernt und nicht übernommen – bitte in Monitor64 neu einrichten.
 
+PROXY64 nutzt die Docker-API auch zur Prüfung der HTTP- und HTTPS-Portfreigaben im Bridge-Netz. Ist die API nicht verfügbar und erreicht die Prüfanfrage über das Gateway den Dienst nicht, zeigt die Portübersicht „nicht prüfbar“. Die externe Erreichbarkeit hängt auch von der Firewall ab.
+
+Mit `NODE64_PROXY_PROBE_IP` kann PROXY64 die Prüfanfrage im Bridge-Netz stattdessen an die öffentliche IPv4- oder IPv6-Adresse schicken. In Docker Compose unter dem Node64-Dienst eintragen und den Container neu erstellen:
+
+```yaml
+    environment:
+      NODE64_PROXY_PROBE_IP: "203.0.113.10"  # durch die öffentliche IP ersetzen
+```
+
+HTTPS wird dabei über den konfigurierten „Port nach außen“ geprüft. Die Anfrage startet im Container. Die öffentliche IP muss daher von dort erreichbar sein. Auch wenn der Test fehlschlägt, kann die Docker-API die Portfreigabe bestätigen. Ohne gültige IP verwendet PROXY64 das Docker-Gateway.
+
 **Sicherheit:** Wer den Docker-Socket hat, kann den Host steuern – auch mit `:ro` (das schützt nur die Datei, nicht die API). Die Node sendet ausschließlich GET-Anfragen. Wer das Risiko begrenzen will, setzt einen [docker-socket-proxy](https://github.com/Tecnativa/docker-socket-proxy) mit `CONTAINERS=1` davor und trägt in der Node `NODE64_DOCKER_HOST=tcp://socket-proxy:2375` ein.
 
 ### Ohne Docker: Debian-Paket (Debian, Ubuntu, Raspberry Pi OS 64 Bit)

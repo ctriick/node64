@@ -5,12 +5,10 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
-	"encoding/json"
 	"io"
 	"net"
 	"net/http"
 	"net/netip"
-	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -22,8 +20,8 @@ import (
 	"github.com/quic-go/quic-go"
 
 	"github.com/ipv64net/node64/internal/dns64/localnet"
+	"github.com/ipv64net/node64/internal/dockerports"
 	"github.com/ipv64net/node64/internal/ports"
-	"github.com/ipv64net/node64/internal/proxmox"
 )
 
 // Docker-Bridge-Netz: Lauscht DNS64 im Container, heisst das noch nicht, dass das Heimnetz den Port erreicht - er
@@ -51,61 +49,12 @@ const pubEvery = 30 * time.Minute
 // Kennung; Variable fuer Tests).
 var pubSelf = os.Hostname
 
-// pubBinding ist ein Port-Binding des eigenen Containers (/containers/{id}/json, NetworkSettings.Ports).
-type pubBinding struct {
-	HostIP   string `json:"HostIp"`
-	HostPort string `json:"HostPort"`
-}
-
-// pubBindings liest die Port-Bindings des eigenen Containers ("53/udp" -> Bindings); nil, wenn die Docker-API nicht
-// erreichbar ist (kein Socket eingebunden) - dann zaehlen nur Gateway und Ankuenfte.
-func pubBindings(ctx context.Context) map[string][]pubBinding {
+func pubBindings(ctx context.Context) dockerports.Bindings {
 	self, err := pubSelf()
-	if err != nil || self == "" {
-		return nil
-	}
-	hc, base, err := proxmox.DockerClient(dockerDNSHost())
 	if err != nil {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/containers/"+url.PathEscape(self)+"/json", nil)
-	if err != nil {
-		return nil
-	}
-	resp, err := hc.Do(req)
-	if err != nil {
-		return nil
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil
-	}
-	var in struct {
-		NetworkSettings struct {
-			Ports map[string][]pubBinding `json:"Ports"`
-		} `json:"NetworkSettings"`
-	}
-	if json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&in) != nil {
-		return nil
-	}
-	return in.NetworkSettings.Ports
-}
-
-// pubBound: key ("53/udp") ist laut Binding unter derselben Nummer auf dem Host veroeffentlicht (auch nur an eine
-// Host-Adresse gebunden; 127.0.0.1 erreicht das LAN nicht).
-func pubBound(b map[string][]pubBinding, key string) bool {
-	p, _, _ := strings.Cut(key, "/")
-	for _, x := range b[key] {
-		if a, err := netip.ParseAddr(x.HostIP); err == nil && a.IsLoopback() {
-			continue
-		}
-		if x.HostPort == p {
-			return true
-		}
-	}
-	return false
+	return dockerports.Read(ctx, dockerDNSHost(), self)
 }
 
 // pubProto: Protokoll im Abfrage-Log zu einem Port der Pruefung.
@@ -286,7 +235,7 @@ func (m *Module) checkPublishedAt(ctx context.Context, e *engine, c config, brid
 			st.Proto[k] = pubProto(c, k)
 		}
 		sort.Strings(keys)
-		var binds map[string][]pubBinding
+		var binds dockerports.Bindings
 		loaded := false
 		for _, key := range keys {
 			if e.local.Probe(ctx, targets[key]) {
@@ -296,7 +245,9 @@ func (m *Module) checkPublishedAt(ctx context.Context, e *engine, c config, brid
 			if !loaded { // Docker-API nur fragen, wenn das Gateway nicht reicht
 				binds, loaded = pubBindings(ctx), true
 			}
-			if pubBound(binds, key) { // z. B. nur an die LAN-Adresse gebunden (#137)
+			port, _, _ := strings.Cut(key, "/")
+			n, _ := strconv.Atoi(port)
+			if binds.Has(key, n) { // z. B. nur an die LAN-Adresse gebunden (#137)
 				st.Verified = append(st.Verified, key)
 			} else {
 				st.Missing = append(st.Missing, key)

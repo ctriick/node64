@@ -305,11 +305,8 @@ func (s *Server) portsPageData(ctx context.Context, module, state string) *ports
 				}
 			}
 		}
-		if d.Pub.Bridge && d.Pub.Gateway != "" && row.Owner == edge.Owner && row.Proto == ports.TCP && row.Active {
-			row.Published = "yes"
-			if d.Pub.MissingPort(row.Port) {
-				row.Published = "no"
-			}
+		if row.Owner == edge.Owner && row.Proto == ports.TCP && row.Active {
+			row.Published = d.Pub.Publication(row.Port)
 		}
 		if row.Port > 0 && row.Port < 1024 {
 			row.Low, row.LowDenied = true, d.Priv.Known && !d.Priv.LowPortOK(row.Port)
